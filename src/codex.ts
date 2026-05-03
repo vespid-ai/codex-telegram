@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AppConfig } from "./config.js";
@@ -18,7 +18,27 @@ export interface CodexResult {
   stderr: string;
 }
 
-export function startCodexRun(config: AppConfig, prompt: string, workspace: string, sessionId?: string): CodexRun {
+export interface CodexRunOptions {
+  onStreamText?: (text: string) => void;
+  onStreamEvent?: (text: string) => void;
+}
+
+export interface CodexSessionSummary {
+  id: string;
+  cwd?: string;
+  title?: string;
+  createdAt?: string;
+  updatedAt: Date;
+  path: string;
+}
+
+export function startCodexRun(
+  config: AppConfig,
+  prompt: string,
+  workspace: string,
+  sessionId?: string,
+  options: CodexRunOptions = {},
+): CodexRun {
   const startedAt = Date.now();
   const tempDir = mkdtempSync(join(tmpdir(), "codex-telegram-"));
   const outputPath = join(tempDir, "last-message.txt");
@@ -42,10 +62,7 @@ export function startCodexRun(config: AppConfig, prompt: string, workspace: stri
     const lines = stdoutBuffer.split(/\r?\n/);
     stdoutBuffer = lines.pop() ?? "";
     for (const line of lines) {
-      const id = extractSessionIdFromJsonLine(line);
-      if (id) {
-        discoveredSessionId = id;
-      }
+      discoveredSessionId = handleJsonEventLine(line, options) ?? discoveredSessionId;
     }
   });
 
@@ -59,7 +76,7 @@ export function startCodexRun(config: AppConfig, prompt: string, workspace: stri
   const promise = new Promise<CodexResult>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => {
-      const trailingId = extractSessionIdFromJsonLine(stdoutBuffer);
+      const trailingId = handleJsonEventLine(stdoutBuffer, options);
       if (trailingId) {
         discoveredSessionId = trailingId;
       }
@@ -95,7 +112,7 @@ function buildNewSessionArgs(config: AppConfig, workspace: string, outputPath: s
 }
 
 function buildResumeArgs(config: AppConfig, sessionId: string, outputPath: string): string[] {
-  const args = ["exec", "resume", "--json", "--output-last-message", outputPath];
+  const args = ["exec", "resume", "--json", "--skip-git-repo-check", "--output-last-message", outputPath];
   if (config.codexModel) args.push("--model", config.codexModel);
   args.push(sessionId, "-");
   return args;
@@ -113,17 +130,156 @@ function terminateChild(child: ChildProcessWithoutNullStreams): void {
   }, 5000).unref();
 }
 
-function extractSessionIdFromJsonLine(line: string): string | undefined {
+function handleJsonEventLine(line: string, options: CodexRunOptions): string | undefined {
   const trimmed = line.trim();
   if (!trimmed) {
     return undefined;
   }
   try {
     const event = JSON.parse(trimmed) as unknown;
+    const streamEvent = formatStreamEvent(event);
+    if (streamEvent) {
+      options.onStreamEvent?.(streamEvent);
+    }
+    const streamText = extractStreamText(event);
+    if (streamText) {
+      options.onStreamText?.(streamText);
+    }
     return extractSessionId(event, false);
   } catch {
     return undefined;
   }
+}
+
+function extractStreamText(value: unknown): string | undefined {
+  if (value == null || typeof value !== "object") {
+    return undefined;
+  }
+
+  if (Array.isArray(value)) {
+    return joinText(value.map(extractStreamText).filter(Boolean));
+  }
+
+  const record = value as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  const payload = record.payload && typeof record.payload === "object" ? (record.payload as Record<string, unknown>) : undefined;
+
+  if (type === "item.completed" && record.item && typeof record.item === "object") {
+    const item = record.item as Record<string, unknown>;
+    if (item.type === "agent_message" && typeof item.text === "string") {
+      return item.text;
+    }
+    return extractAssistantMessageText(item);
+  }
+
+  if (type === "event_msg" && payload?.type === "agent_message" && typeof payload.message === "string") {
+    return payload.message;
+  }
+
+  if (type === "agent_message" && typeof record.message === "string") {
+    return record.message;
+  }
+
+  if (type === "response_item" && payload) {
+    return extractAssistantMessageText(payload);
+  }
+
+  return extractAssistantMessageText(record);
+}
+
+function formatStreamEvent(value: unknown): string | undefined {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  if (type === "thread.started") {
+    return "Session started";
+  }
+  if (type === "turn.started") {
+    return "Turn started";
+  }
+  if (type === "turn.completed") {
+    return "Turn completed";
+  }
+  if (type === "item.started") {
+    return formatItemEvent("Started", record.item);
+  }
+  if (type === "item.completed") {
+    return formatItemEvent("Completed", record.item);
+  }
+  return undefined;
+}
+
+function formatItemEvent(prefix: string, item: unknown): string | undefined {
+  if (!item || typeof item !== "object") {
+    return undefined;
+  }
+  const record = item as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  if (type === "agent_message") {
+    return `${prefix}: assistant message`;
+  }
+  if (type === "reasoning") {
+    return `${prefix}: reasoning`;
+  }
+  if (type === "function_call") {
+    const name = typeof record.name === "string" ? record.name : "tool call";
+    return `${prefix}: ${name}`;
+  }
+  if (type === "function_call_output") {
+    return `${prefix}: tool output`;
+  }
+  if (type) {
+    return `${prefix}: ${type}`;
+  }
+  return undefined;
+}
+
+function extractAssistantMessageText(record: Record<string, unknown>): string | undefined {
+  const type = typeof record.type === "string" ? record.type : "";
+  const role = typeof record.role === "string" ? record.role : "";
+
+  if (type === "message" && role === "assistant") {
+    return extractContentText(record.content);
+  }
+
+  const item = record.item;
+  if (item && typeof item === "object") {
+    return extractAssistantMessageText(item as Record<string, unknown>);
+  }
+
+  return undefined;
+}
+
+function extractContentText(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+
+  const texts = content
+    .map((part) => {
+      if (!part || typeof part !== "object") return undefined;
+      const record = part as Record<string, unknown>;
+      if (typeof record.text === "string") return record.text;
+      if (typeof record.output_text === "string") return record.output_text;
+      return undefined;
+    })
+    .filter(Boolean);
+
+  return joinText(texts);
+}
+
+function joinText(parts: Array<string | undefined>): string | undefined {
+  const text = parts
+    .filter((part): part is string => Boolean(part?.trim()))
+    .join("\n\n")
+    .trim();
+  return text || undefined;
 }
 
 function extractSessionId(value: unknown, inSessionContext: boolean): string | undefined {
@@ -181,6 +337,43 @@ export function findLatestCodexSessionId(options: { startedAt?: number; workspac
   return candidates.map((candidate) => readSessionMeta(candidate.path)?.id).find(Boolean);
 }
 
+export function listCodexSessions(options: { workspace?: string; all?: boolean; limit?: number }): CodexSessionSummary[] {
+  const root = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions");
+  if (!existsSync(root)) {
+    return [];
+  }
+
+  const limit = options.limit ?? 10;
+  const sessions: CodexSessionSummary[] = [];
+  const candidates = listJsonlFiles(root)
+    .map((path) => ({ path, mtimeMs: statSync(path).mtimeMs }))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  for (const candidate of candidates) {
+    const session = readSessionSummary(candidate.path, candidate.mtimeMs);
+    if (!session?.id) continue;
+    if (!(options.all || !options.workspace || !session.cwd || session.cwd === options.workspace)) continue;
+    sessions.push(session);
+    if (sessions.length >= limit) {
+      break;
+    }
+  }
+
+  return sessions;
+}
+
+export function resolveCodexSessionRef(ref: string, options: { workspace?: string; all?: boolean }): string | undefined {
+  if (UUID_RE.test(ref)) {
+    return ref;
+  }
+  if (!/^[0-9a-f]{6,36}$/i.test(ref)) {
+    return undefined;
+  }
+
+  const matches = listCodexSessions({ ...options, limit: 200 }).filter((session) => session.id.startsWith(ref));
+  return matches.length === 1 ? matches[0].id : undefined;
+}
+
 function listJsonlFiles(dir: string): string[] {
   const entries = readdirSync(dir, { withFileTypes: true });
   const files: string[] = [];
@@ -196,7 +389,7 @@ function listJsonlFiles(dir: string): string[] {
 }
 
 function readSessionMeta(path: string): { id?: string; cwd?: string } | undefined {
-  const head = readFileSync(path, "utf8").split(/\r?\n/, 8);
+  const head = readFilePrefix(path).split(/\r?\n/, 8);
   for (const line of head) {
     try {
       const parsed = JSON.parse(line) as Record<string, unknown>;
@@ -211,4 +404,51 @@ function readSessionMeta(path: string): { id?: string; cwd?: string } | undefine
     }
   }
   return undefined;
+}
+
+function readSessionSummary(path: string, mtimeMs: number): CodexSessionSummary | undefined {
+  const lines = readFilePrefix(path).split(/\r?\n/, 200);
+  let id: string | undefined;
+  let cwd: string | undefined;
+  let createdAt: string | undefined;
+  let title: string | undefined;
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (parsed.type === "session_meta") {
+        const payload = parsed.payload as Record<string, unknown> | undefined;
+        id = typeof payload?.id === "string" ? payload.id : id;
+        cwd = typeof payload?.cwd === "string" ? payload.cwd : cwd;
+        createdAt = typeof payload?.timestamp === "string" ? payload.timestamp : createdAt;
+        continue;
+      }
+      if (parsed.type === "event_msg") {
+        const payload = parsed.payload as Record<string, unknown> | undefined;
+        if (payload?.type === "thread_name_updated" && typeof payload.thread_name === "string") {
+          title = payload.thread_name;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  if (!id) {
+    return undefined;
+  }
+  return { id, cwd, title, createdAt, updatedAt: new Date(mtimeMs), path };
+}
+
+function readFilePrefix(path: string, maxBytes = 256 * 1024): string {
+  const size = statSync(path).size;
+  const buffer = Buffer.alloc(Math.min(size, maxBytes));
+  const fd = openSync(path, "r");
+  try {
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    closeSync(fd);
+  }
 }

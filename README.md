@@ -48,7 +48,9 @@ Logs are written to `logs/launchd.out.log` and `logs/launchd.err.log`.
 - `/help` shows usage.
 - `/status` shows the current topic mapping and busy state.
 - `/session` shows the Codex session id for this topic.
-- `/resume <session-id|thread-name> [prompt]` binds this topic to an existing Codex session. If a prompt is supplied, it is sent immediately.
+- `/resume` lists recent Codex sessions for the current workspace in a Telegram-friendly format.
+- `/resume --all` lists recent Codex sessions across all workspaces.
+- `/resume <short-id|session-id|thread-name> [prompt]` binds this topic to an existing Codex session. Short ids are the 8-character prefixes shown by `/resume`. If a prompt is supplied, it is sent immediately.
 - `/resume --last [prompt]` binds this topic to the latest Codex session in the current workspace. Add `--all` to ignore workspace filtering.
 - `/cwd [path]` shows or switches this topic's Codex workspace. Switching workspace starts the next message in a fresh Codex session because existing Codex sessions cannot be safely moved to another cwd.
 - `/new [prompt]` starts a fresh Codex session in this topic. If a prompt is supplied, it is sent immediately.
@@ -59,6 +61,8 @@ Logs are written to `logs/launchd.out.log` and `logs/launchd.err.log`.
 
 - The bot should receive normal messages in topic threads. In a topic-enabled supergroup, Telegram includes `message_thread_id`; the bridge uses it as the session boundary.
 - Messages in one topic are serialized. If Codex is still running, later messages in the same topic wait their turn.
+- Codex can keep producing Markdown, but long Telegram replies are normalized before sending: headings, links, lists, inline code, emphasis, and fenced code blocks are converted to a simpler Telegram-readable text form.
+- While Codex is running, assistant text events are shown as a throttled Telegram preview message; the final complete answer is still sent after the run finishes.
 - Attachments are not bridged yet. The first production-worthy extension is downloading Telegram photos/files and passing them to Codex with `--image`.
 
 ## License
