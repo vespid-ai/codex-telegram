@@ -1,0 +1,40 @@
+{
+  "name": "codex-telegram",
+  "version": "1.0.0",
+  "description": "Telegram forum-topic bridge for Codex CLI sessions.",
+  "main": "dist/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vespid-ai/codex-telegram.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vespid-ai/codex-telegram/issues"
+  },
+  "homepage": "https://github.com/vespid-ai/codex-telegram#readme",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "codex",
+    "telegram",
+    "bot",
+    "agent",
+    "automation"
+  ],
+  "author": "Vespid AI",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "grammy": "^1.42.0",
+    "https-proxy-agent": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
