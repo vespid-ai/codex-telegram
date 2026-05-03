@@ -3,6 +3,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { startAppServerRealtimeRun, startAppServerTextRun } from "./appserver.js";
 import { loadConfig } from "./config.js";
 import {
   findLatestCodexSessionId,
@@ -12,8 +13,25 @@ import {
   type CodexRun,
   type GeneratedImage,
   type CodexSessionSummary,
+  type StreamTextMode,
 } from "./codex.js";
+import {
+  clearThreadGoal,
+  formatThreadGoal,
+  getThreadGoal,
+  setThreadGoalObjective,
+  setThreadGoalStatus,
+  threadExists,
+} from "./goal.js";
 import { StateStore, topicKey, type TopicSession } from "./state.js";
+import {
+  escapeHtml,
+  formatMarkdownForTelegramHtml,
+  formatStreamPreviewHtml,
+  splitTelegramHtml,
+  telegramHtmlToPlainText,
+} from "./telegram-format.js";
+import { prepareTelegramVoice } from "./voice.js";
 
 const config = loadConfig();
 const store = new StateStore(config.stateFile);
@@ -32,7 +50,7 @@ const activeRuns = new Map<string, CodexRun>();
 const botInfo = await bot.api.getMe();
 const botUsername = botInfo.username.toLowerCase();
 const STREAM_UPDATE_MS = 1500;
-const STREAM_PREVIEW_CHARS = 2600;
+const STREAM_PREVIEW_CHARS = 420;
 
 bot.command("start", async (ctx) => {
   await replyInTopic(ctx, helpText());
@@ -55,6 +73,7 @@ bot.command("status", async (ctx) => {
       `Topic: ${topic.key}`,
       `Session: ${session?.codexSessionId ? shortId(session.codexSessionId) : "not created"}`,
       `Workspace: ${compactPath(getWorkspace(session))}`,
+      `Text runner: ${config.codexTextRunner}`,
       `Busy: ${busy ? "yes" : "no"}`,
       `Queued or running: ${queued ? "yes" : "no"}`,
     ].join("\n"),
@@ -63,6 +82,10 @@ bot.command("status", async (ctx) => {
 
 bot.command("session", async (ctx) => {
   await replySession(ctx);
+});
+
+bot.command("goal", async (ctx) => {
+  await handleGoalCommand(ctx, typeof ctx.match === "string" ? ctx.match : "");
 });
 
 bot.command("resume", async (ctx) => {
@@ -217,6 +240,14 @@ bot.on("message:text", async (ctx) => {
   }
 });
 
+bot.on("message:voice", async (ctx) => {
+  const topic = getTopic(ctx);
+  const queued = schedule(topic.key, () => runVoice(ctx));
+  if (queued) {
+    await replyInTopic(ctx, "Queued voice message behind the active Codex run in this topic.");
+  }
+});
+
 bot.catch(async (err) => {
   console.error("bot error", err);
 });
@@ -228,6 +259,7 @@ await bot.api.setMyCommands([
   { command: "help", description: "Show Codex Telegram bridge usage" },
   { command: "status", description: "Show current topic status" },
   { command: "session", description: "Show current Codex session id" },
+  { command: "goal", description: "Show or set the Codex thread goal" },
   { command: "resume", description: "Bind this topic to an existing Codex session" },
   { command: "cwd", description: "Show or switch this topic's Codex workspace" },
   { command: "new", description: "Start a fresh Codex session in this topic" },
@@ -235,7 +267,9 @@ await bot.api.setMyCommands([
   { command: "cancel", description: "Cancel the active Codex run in this topic" },
 ]);
 
-console.log(`codex-telegram bridge started; bot=@${botUsername}; workspace=${config.codexWorkspace}; state=${config.stateFile}`);
+console.log(
+  `codex-telegram bridge started; bot=@${botUsername}; workspace=${config.codexWorkspace}; textRunner=${config.codexTextRunner}; state=${config.stateFile}`,
+);
 await bot.start();
 
 async function runPrompt(ctx: Context, prompt: string, forceFresh: boolean): Promise<void> {
@@ -252,21 +286,16 @@ async function runPrompt(ctx: Context, prompt: string, forceFresh: boolean): Pro
     lastPrompt: prompt,
   });
 
-  const statusMessage = session.codexSessionId
-    ? `Resuming Codex session ${shortId(session.codexSessionId)}...`
-    : "Creating a new Codex session for this topic...";
-  await replyInTopic(ctx, statusMessage);
-
   const streamPreview = createTelegramStreamPreview(ctx);
-  await streamPreview.start(session.codexSessionId ? `Resuming ${shortId(session.codexSessionId)}...` : "Starting new Codex session...");
-  const run = startCodexRun(config, prompt, workspace, session.codexSessionId, {
+  await streamPreview.start(session.codexSessionId ? `继续会话 ${shortId(session.codexSessionId)}...` : "正在创建新的 Codex 会话...");
+  const run = startTextRun(prompt, workspace, session.codexSessionId, {
     onStreamText: streamPreview.push,
     onStreamEvent: streamPreview.event,
   });
   activeRuns.set(topic.key, run);
 
   const heartbeat = setInterval(() => {
-    void replyInTopic(ctx, `Codex is still working in this topic (${shortId(store.get(topic.key)?.codexSessionId) ?? "new session"}).`);
+    void streamPreview.heartbeat(`仍在处理 (${shortId(store.get(topic.key)?.codexSessionId) ?? "新会话"})...`);
   }, config.statusUpdateMs);
   heartbeat.unref();
 
@@ -288,15 +317,103 @@ async function runPrompt(ctx: Context, prompt: string, forceFresh: boolean): Pro
       }
     }
 
-    await streamPreview.finish("Codex finished. Final result below.");
+    await streamPreview.finish("已完成，完整回复如下。", { compact: true });
     const sentImages = await replyGeneratedImages(ctx, result.generatedImages);
     const finalText = result.output || result.stderr || (sentImages > 0 ? "" : "Codex completed without a final message.");
     if (finalText) {
-      await replyLong(ctx, finalText, "Codex result");
+      await replyLong(ctx, finalText, "完整回复");
     }
   } catch (error) {
-    await streamPreview.finish("Codex stopped. Error below.");
-    await replyLong(ctx, formatError(error), "Codex error");
+    await streamPreview.finish("运行失败，错误如下。", { compact: true });
+    await replyLong(ctx, formatError(error), "运行错误");
+  } finally {
+    clearInterval(heartbeat);
+    activeRuns.delete(topic.key);
+  }
+}
+
+function startTextRun(
+  prompt: string,
+  workspace: string,
+  sessionId: string | undefined,
+  options: {
+    onStreamText?: (text: string, mode?: StreamTextMode) => void;
+    onStreamEvent?: (text: string) => void;
+  },
+): CodexRun {
+  if (config.codexTextRunner === "app-server") {
+    return startAppServerTextRun(config, {
+      workspace,
+      sessionId,
+      prompt,
+      ...options,
+    });
+  }
+
+  return startCodexRun(config, prompt, workspace, sessionId, options);
+}
+
+async function runVoice(ctx: Context): Promise<void> {
+  const topic = getTopic(ctx);
+  const existing = store.get(topic.key);
+  const workspace = getWorkspace(existing);
+  const session = store.upsert({
+    key: topic.key,
+    chatId: topic.chatId,
+    threadId: topic.threadId,
+    title: topic.title ?? existing?.title,
+    workspace,
+    codexSessionId: existing?.codexSessionId,
+    lastPrompt: "[Telegram voice message]",
+  });
+
+  const streamPreview = createTelegramStreamPreview(ctx);
+  await streamPreview.start(session.codexSessionId ? `正在处理语音 (${shortId(session.codexSessionId)})...` : "正在创建语音会话...");
+
+  const heartbeat = setInterval(() => {
+    void streamPreview.heartbeat(`语音仍在处理 (${shortId(store.get(topic.key)?.codexSessionId) ?? "新会话"})...`);
+  }, config.statusUpdateMs);
+  heartbeat.unref();
+
+  try {
+    const prepared = await prepareTelegramVoice(ctx, config, topic);
+    streamPreview.event(`语音已转换：${compactPath(prepared.wavPath)}`);
+
+    const run = startAppServerRealtimeRun(config, {
+      workspace,
+      sessionId: session.codexSessionId,
+      audio: prepared.frame,
+      onStreamText: streamPreview.push,
+      onStreamEvent: streamPreview.event,
+    });
+    activeRuns.set(topic.key, run);
+
+    const result = await run.promise;
+    if (result.sessionId && result.sessionId !== session.codexSessionId) {
+      if (store.get(topic.key)) {
+        store.setSessionId(topic.key, result.sessionId);
+      } else {
+        store.upsert({
+          key: topic.key,
+          chatId: topic.chatId,
+          threadId: topic.threadId,
+          title: topic.title,
+          workspace,
+          codexSessionId: result.sessionId,
+          lastPrompt: "[Telegram voice message]",
+        });
+      }
+    }
+
+    await streamPreview.finish("语音处理完成，完整回复如下。", { compact: true });
+    const sentImages = await replyGeneratedImages(ctx, result.generatedImages);
+    const finalText = result.output || result.stderr || (sentImages > 0 ? "" : "Codex realtime completed without a final message.");
+    if (finalText) {
+      await replyLong(ctx, finalText, "语音回复");
+    }
+  } catch (error) {
+    await streamPreview.finish("语音处理失败，错误如下。", { compact: true });
+    await replyLong(ctx, formatError(error), "语音错误");
   } finally {
     clearInterval(heartbeat);
     activeRuns.delete(topic.key);
@@ -346,6 +463,53 @@ async function replySession(ctx: Context): Promise<void> {
   await replyInTopic(ctx, session?.codexSessionId ? session.codexSessionId : "This topic does not have a Codex session yet.");
 }
 
+async function handleGoalCommand(ctx: Context, input: string): Promise<void> {
+  const topic = getTopic(ctx);
+  const session = store.get(topic.key);
+  const threadId = session?.codexSessionId;
+  if (!threadId) {
+    await replyInTopic(ctx, "No Codex session is bound to this topic yet.\nSend a normal message first, or use /resume to bind an existing session.");
+    return;
+  }
+
+  try {
+    if (!(await threadExists(config.codexStateDb, threadId))) {
+      await replyInTopic(ctx, `The bound Codex session is not present in the Codex state DB:\n${threadId}`);
+      return;
+    }
+
+    const args = input.trim();
+    if (!args) {
+      const goal = await getThreadGoal(config.codexStateDb, threadId);
+      await replyInTopic(ctx, goal ? formatThreadGoal(goal) : "Usage: /goal <objective>\nNo goal is currently set.");
+      return;
+    }
+
+    const control = args.toLowerCase();
+    if (control === "clear") {
+      const cleared = await clearThreadGoal(config.codexStateDb, threadId);
+      await replyInTopic(ctx, cleared ? "Goal cleared" : "No goal to clear\nThis thread does not currently have a goal.");
+      return;
+    }
+
+    if (control === "pause" || control === "unpause") {
+      const existingGoal = await getThreadGoal(config.codexStateDb, threadId);
+      if (!existingGoal) {
+        await replyInTopic(ctx, "No goal is currently set.\nUse /goal <objective> first.");
+        return;
+      }
+      const goal = await setThreadGoalStatus(config.codexStateDb, threadId, control === "pause" ? "paused" : "active");
+      await replyInTopic(ctx, formatThreadGoal(goal));
+      return;
+    }
+
+    const goal = await setThreadGoalObjective(config.codexStateDb, threadId, args);
+    await replyInTopic(ctx, formatThreadGoal(goal));
+  } catch (error) {
+    await replyLong(ctx, formatError(error), "Goal error");
+  }
+}
+
 async function handleCommandFallback(ctx: Context, text: string): Promise<boolean> {
   const command = parseFallbackCommand(text);
   if (!command) {
@@ -356,6 +520,11 @@ async function handleCommandFallback(ctx: Context, text: string): Promise<boolea
     case "session":
       await replySession(ctx);
       return true;
+    case "goal": {
+      const rest = text.replace(/^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?\s*/, "");
+      await handleGoalCommand(ctx, rest);
+      return true;
+    }
     case "help":
     case "start":
       await replyInTopic(ctx, helpText());
@@ -380,26 +549,37 @@ function parseFallbackCommand(text: string): string | undefined {
 }
 
 async function replyLong(ctx: Context, text: string, label = "Message"): Promise<void> {
-  const readableText = formatMarkdownForTelegram(text);
-  const chunks = splitText(readableText, config.maxTelegramChars);
+  const readableText = formatMarkdownForTelegramHtml(text);
+  const chunks = splitTelegramHtml(readableText, config.maxTelegramChars);
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
-    const header = chunks.length > 1 ? `${label} ${index + 1}/${chunks.length}\n\n` : "";
-    await replyInTopic(ctx, `${header}${chunk}`);
+    const header = chunks.length > 1 ? `<b>${escapeHtml(label)} ${index + 1}/${chunks.length}</b>\n\n` : "";
+    await replyInTopic(ctx, `${header}${chunk}`, { parseMode: "HTML" });
   }
 }
 
-async function replyInTopic(ctx: Context, text: string) {
+async function replyInTopic(ctx: Context, text: string, options: { parseMode?: "HTML" } = {}) {
   const threadId = ctx.message?.message_thread_id;
+  const replyOptions = {
+    ...(threadId ? { message_thread_id: threadId } : {}),
+    ...(options.parseMode ? { parse_mode: options.parseMode } : {}),
+  };
   try {
-    return await ctx.reply(text, threadId ? { message_thread_id: threadId } : undefined);
+    return await ctx.reply(text, replyOptions);
   } catch (error) {
     console.error("failed to send Telegram message; retrying once", error);
     await delay(1000);
     try {
-      return await ctx.reply(text, threadId ? { message_thread_id: threadId } : undefined);
+      return await ctx.reply(text, replyOptions);
     } catch (retryError) {
       console.error("failed to send Telegram message after retry", retryError);
+      if (options.parseMode === "HTML") {
+        try {
+          return await ctx.reply(telegramHtmlToPlainText(text), threadId ? { message_thread_id: threadId } : undefined);
+        } catch (fallbackError) {
+          console.error("failed to send Telegram plain-text fallback", fallbackError);
+        }
+      }
       return undefined;
     }
   }
@@ -430,8 +610,9 @@ async function replyGeneratedImages(ctx: Context, images: GeneratedImage[]): Pro
 function createTelegramStreamPreview(ctx: Context): {
   start: (status: string) => Promise<void>;
   event: (text: string) => void;
-  push: (text: string) => void;
-  finish: (status: string) => Promise<void>;
+  push: (text: string, mode?: StreamTextMode) => void;
+  heartbeat: (status: string) => Promise<void>;
+  finish: (status: string, options?: { compact?: boolean }) => Promise<void>;
 } {
   const chatId = ctx.chat?.id;
   let buffer = "";
@@ -456,14 +637,26 @@ function createTelegramStreamPreview(ctx: Context): {
       .then(async () => {
         try {
           if (messageId) {
-            await ctx.api.editMessageText(chatId, messageId, text);
+            await ctx.api.editMessageText(chatId, messageId, text, { parse_mode: "HTML" });
           } else {
-            const sent = await replyInTopic(ctx, text);
+            const sent = await replyInTopic(ctx, text, { parseMode: "HTML" });
             messageId = sent?.message_id;
           }
           lastSent = text;
         } catch (error) {
           console.error("failed to update stream preview", error);
+          try {
+            const fallback = telegramHtmlToPlainText(text);
+            if (messageId) {
+              await ctx.api.editMessageText(chatId, messageId, fallback);
+            } else {
+              const sent = await replyInTopic(ctx, fallback);
+              messageId = sent?.message_id;
+            }
+            lastSent = text;
+          } catch (fallbackError) {
+            console.error("failed to update stream preview plain-text fallback", fallbackError);
+          }
         }
       });
     return pending;
@@ -472,23 +665,30 @@ function createTelegramStreamPreview(ctx: Context): {
   return {
     async start(status: string): Promise<void> {
       events.push(`${formatTime(new Date())} ${status}`);
-      await flush("Codex is running...");
+      await flush("正在处理...");
     },
     event(text: string): void {
       events.push(`${formatTime(new Date())} ${text}`);
       while (events.length > 8) {
         events.shift();
       }
-      void flushSoon("Codex is running...");
+      void flushSoon("正在处理...");
     },
-    push(text: string): void {
+    push(text: string, mode: StreamTextMode = "snapshot"): void {
       if (!text.trim()) {
         return;
       }
-      buffer = mergeStreamText(buffer, text);
-      void flushSoon("Codex is writing...");
+      buffer = mergeStreamText(buffer, text, mode);
+      void flushSoon("正在生成回复...");
     },
-    async finish(status: string): Promise<void> {
+    async heartbeat(status: string): Promise<void> {
+      await flush(status);
+    },
+    async finish(status: string, options: { compact?: boolean } = {}): Promise<void> {
+      if (options.compact) {
+        buffer = "";
+        events.splice(0, events.length);
+      }
       await flush(status);
     },
   };
@@ -503,7 +703,17 @@ function createTelegramStreamPreview(ctx: Context): {
   }
 }
 
-function mergeStreamText(current: string, next: string): string {
+function mergeStreamText(current: string, next: string, mode: StreamTextMode): string {
+  if (mode === "delta") {
+    if (!current) {
+      return next.trimStart();
+    }
+    if (current.endsWith(next)) {
+      return current;
+    }
+    return `${current}${next}`;
+  }
+
   const cleanNext = next.trim();
   if (!current) {
     return cleanNext;
@@ -518,22 +728,7 @@ function mergeStreamText(current: string, next: string): string {
 }
 
 function buildStreamPreview(text: string, events: string[], status: string): string | undefined {
-  const readable = formatMarkdownForTelegram(text).trim();
-  if (!readable && events.length === 0) {
-    return undefined;
-  }
-  const preview =
-    readable.length > STREAM_PREVIEW_CHARS
-      ? `...${readable.slice(readable.length - STREAM_PREVIEW_CHARS).trimStart()}`
-      : readable;
-  const parts = [status];
-  if (events.length > 0) {
-    parts.push(["Events", ...events.map((event) => `- ${event}`)].join("\n"));
-  }
-  if (preview) {
-    parts.push(["Preview", preview].join("\n"));
-  }
-  return parts.join("\n\n");
+  return formatStreamPreviewHtml({ text, events, status, maxChars: STREAM_PREVIEW_CHARS });
 }
 
 function formatTime(date: Date): string {
@@ -549,104 +744,17 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-function splitText(text: string, maxChars: number): string[] {
-  if (text.length <= maxChars) {
-    return [text];
-  }
-
-  const chunks: string[] = [];
-  let rest = text;
-  while (rest.length > maxChars) {
-    const slice = rest.slice(0, maxChars);
-    const breakAt = Math.max(slice.lastIndexOf("\n\n"), slice.lastIndexOf("\n"), slice.lastIndexOf(" "));
-    const end = breakAt > maxChars * 0.6 ? breakAt : maxChars;
-    chunks.push(rest.slice(0, end).trimEnd());
-    rest = rest.slice(end).trimStart();
-  }
-  if (rest) {
-    chunks.push(rest);
-  }
-  return chunks;
-}
-
-function formatMarkdownForTelegram(text: string): string {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  const output: string[] = [];
-  let inCodeBlock = false;
-
-  for (const line of lines) {
-    if (/^\s*```/.test(line)) {
-      inCodeBlock = !inCodeBlock;
-      if (output.length > 0 && output[output.length - 1] !== "") {
-        output.push("");
-      }
-      continue;
-    }
-
-    if (inCodeBlock) {
-      output.push(line.replace(/\s+$/g, ""));
-      continue;
-    }
-
-    output.push(formatMarkdownLineForTelegram(line));
-  }
-
-  return output
-    .join("\n")
-    .replace(/\n{4,}/g, "\n\n\n")
-    .trim();
-}
-
-function formatMarkdownLineForTelegram(line: string): string {
-  let next = line.replace(/\s+$/g, "");
-
-  if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(next)) {
-    return "";
-  }
-
-  next = next.replace(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/, "$1");
-  next = next.replace(/^(\s*)[-*+]\s+\[( |x|X)\]\s+/g, "$1- [$2] ");
-  next = next.replace(/^(\s*)[-*+]\s+/g, "$1- ");
-  next = next.replace(/^(\s*)>\s?/g, "$1> ");
-  next = next.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_match, alt: string, url: string) =>
-    alt ? `${alt}: ${url}` : url,
-  );
-  next = next.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_match, label: string, url: string) =>
-    label === url ? url : `${label}: ${url}`,
-  );
-  next = next.replace(/`([^`\n]+)`/g, "$1");
-  next = next.replace(/\*\*([^*\n]+)\*\*/g, "$1");
-  next = next.replace(/__([^_\n]+)__/g, "$1");
-  next = next.replace(/~~([^~\n]+)~~/g, "$1");
-  next = next.replace(/(^|[\s([{])\*([^*\n]+)\*(?=[\s)\]},.!?:;]|$)/g, "$1$2");
-  next = next.replace(/(^|[\s([{])_([^_\n]+)_(?=[\s)\]},.!?:;]|$)/g, "$1$2");
-
-  if (/^\s*\|.+\|\s*$/.test(next)) {
-    next = next
-      .trim()
-      .replace(/^\|/, "")
-      .replace(/\|$/, "")
-      .split("|")
-      .map((cell) => cell.trim())
-      .join(" | ");
-  }
-
-  if (/^\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+$/.test(next)) {
-    return "";
-  }
-
-  return next;
-}
-
 function helpText(): string {
   return [
     "Codex Telegram bridge",
     "",
     "Normal messages in this Telegram topic continue the same Codex session.",
+    "Telegram voice messages are sent to Codex realtime voice input.",
     "",
     "Commands",
     "/status - current topic state",
     "/session - current Codex session id",
+    "/goal [objective|pause|unpause|clear] - show or change the Codex thread goal",
     "/resume - show recent sessions",
     "/resume <short-id|session-id> [prompt] - bind this topic to a session",
     "/resume --all - show recent sessions from all workspaces",
@@ -868,9 +976,9 @@ function truncateLine(text: string, maxChars: number): string {
 
 function formatError(error: unknown): string {
   if (error instanceof Error) {
-    return `Codex run failed:\n${error.message}`;
+    return `运行失败：\n${error.message}`;
   }
-  return `Codex run failed:\n${String(error)}`;
+  return `运行失败：\n${String(error)}`;
 }
 
 function shutdown(): void {

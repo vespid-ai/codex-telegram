@@ -15,6 +15,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "test:format": "tsx scripts/smoke-telegram-format.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [

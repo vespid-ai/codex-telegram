@@ -20,9 +20,11 @@ export interface CodexResult {
 }
 
 export interface CodexRunOptions {
-  onStreamText?: (text: string) => void;
+  onStreamText?: (text: string, mode?: StreamTextMode) => void;
   onStreamEvent?: (text: string) => void;
 }
+
+export type StreamTextMode = "delta" | "snapshot";
 
 export interface GeneratedImage {
   path: string;
@@ -161,7 +163,7 @@ function handleJsonEventLine(
     }
     const streamText = extractStreamText(event);
     if (streamText) {
-      options.onStreamText?.(streamText);
+      options.onStreamText?.(streamText, "snapshot");
     }
     return {
       sessionId: extractSessionId(event, false),
@@ -172,7 +174,7 @@ function handleJsonEventLine(
   }
 }
 
-function extractGeneratedImages(value: unknown): GeneratedImage[] {
+export function extractGeneratedImages(value: unknown): GeneratedImage[] {
   if (value == null || typeof value !== "object") {
     return [];
   }
@@ -188,12 +190,24 @@ function extractGeneratedImages(value: unknown): GeneratedImage[] {
 
   for (const candidate of candidates) {
     const type = typeof candidate.type === "string" ? candidate.type : "";
-    const savedPath = typeof candidate.saved_path === "string" ? candidate.saved_path : undefined;
+    const savedPath =
+      typeof candidate.saved_path === "string"
+        ? candidate.saved_path
+        : typeof candidate.savedPath === "string"
+          ? candidate.savedPath
+          : undefined;
     if ((type === "image_generation_end" || type === "image_generation_call") && savedPath) {
       images.push({
         path: savedPath,
         revisedPrompt: typeof candidate.revised_prompt === "string" ? candidate.revised_prompt : undefined,
         callId: typeof candidate.call_id === "string" ? candidate.call_id : typeof candidate.id === "string" ? candidate.id : undefined,
+      });
+    }
+    if (type === "imageGeneration" && savedPath) {
+      images.push({
+        path: savedPath,
+        revisedPrompt: typeof candidate.revisedPrompt === "string" ? candidate.revisedPrompt : undefined,
+        callId: typeof candidate.id === "string" ? candidate.id : undefined,
       });
     }
   }
