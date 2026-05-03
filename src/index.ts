@@ -4,7 +4,7 @@ import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { loadConfig } from "./config.js";
-import { startCodexRun, type CodexRun } from "./codex.js";
+import { findLatestCodexSessionId, startCodexRun, type CodexRun } from "./codex.js";
 import { StateStore, topicKey, type TopicSession } from "./state.js";
 
 const config = loadConfig();
@@ -51,6 +51,51 @@ bot.command("session", async (ctx) => {
   const topic = getTopic(ctx);
   const session = store.get(topic.key);
   await replyInTopic(ctx, session?.codexSessionId ? session.codexSessionId : "This topic does not have a Codex session yet.");
+});
+
+bot.command("resume", async (ctx) => {
+  const topic = getTopic(ctx);
+  const existing = store.get(topic.key);
+  const workspace = getWorkspace(existing);
+  const request = parseResumeRequest(typeof ctx.match === "string" ? ctx.match : "");
+
+  if (!request.last && !request.sessionRef) {
+    await replyInTopic(ctx, resumeUsage());
+    return;
+  }
+
+  const sessionRef = request.last
+    ? findLatestCodexSessionId({ workspace, all: request.all })
+    : request.sessionRef;
+
+  if (!sessionRef) {
+    await replyInTopic(
+      ctx,
+      request.last
+        ? `No previous Codex session found${request.all ? "." : ` for workspace:\n${workspace}`}`
+        : "No Codex session id or thread name was provided.",
+    );
+    return;
+  }
+
+  store.upsert({
+    key: topic.key,
+    chatId: topic.chatId,
+    threadId: topic.threadId,
+    title: topic.title ?? existing?.title,
+    workspace,
+    codexSessionId: sessionRef,
+  });
+
+  if (request.prompt) {
+    const queued = schedule(topic.key, () => runPrompt(ctx, request.prompt, false));
+    if (queued) {
+      await replyInTopic(ctx, `Queued resume of Codex session ${shortId(sessionRef)}.`);
+    }
+    return;
+  }
+
+  await replyInTopic(ctx, `This topic now resumes Codex session:\n${sessionRef}\nSend a normal message here to continue it.`);
 });
 
 bot.command("cwd", async (ctx) => {
@@ -133,9 +178,9 @@ bot.on("message:forum_topic_created", async (ctx) => {
     key: topic.key,
     chatId: topic.chatId,
     threadId: topic.threadId,
-      title: topic.title,
-      workspace: existingWorkspace(topic.key),
-    });
+    title: topic.title,
+    workspace: existingWorkspace(topic.key),
+  });
 });
 
 bot.on("message:text", async (ctx) => {
@@ -161,6 +206,7 @@ await bot.api.setMyCommands([
   { command: "help", description: "Show Codex Telegram bridge usage" },
   { command: "status", description: "Show current topic status" },
   { command: "session", description: "Show current Codex session id" },
+  { command: "resume", description: "Bind this topic to an existing Codex session" },
   { command: "cwd", description: "Show or switch this topic's Codex workspace" },
   { command: "new", description: "Start a fresh Codex session in this topic" },
   { command: "reset", description: "Forget this topic mapping" },
@@ -302,10 +348,54 @@ function helpText(): string {
     "",
     "/status - show this topic mapping and busy state",
     "/session - show this topic's Codex session id",
+    "/resume <session-id|thread-name> [prompt] - bind this topic to an existing Codex session",
+    "/resume --last [prompt] - bind this topic to the latest Codex session in the current workspace",
     "/cwd [path] - show or switch this topic's Codex workspace",
     "/new [prompt] - start a fresh Codex session in this topic",
     "/reset - forget this topic mapping",
     "/cancel - terminate the active Codex run in this topic",
+  ].join("\n");
+}
+
+interface ResumeRequest {
+  sessionRef?: string;
+  last: boolean;
+  all: boolean;
+  prompt: string;
+}
+
+function parseResumeRequest(input: string): ResumeRequest {
+  const tokens = input.trim().split(/\s+/).filter(Boolean);
+  let last = false;
+  let all = false;
+  let sessionRef: string | undefined;
+  const promptTokens: string[] = [];
+
+  for (const token of tokens) {
+    if (!sessionRef && token === "--last") {
+      last = true;
+      continue;
+    }
+    if (!sessionRef && token === "--all") {
+      all = true;
+      continue;
+    }
+    if (!last && !sessionRef) {
+      sessionRef = token;
+      continue;
+    }
+    promptTokens.push(token);
+  }
+
+  return { sessionRef, last, all, prompt: promptTokens.join(" ") };
+}
+
+function resumeUsage(): string {
+  return [
+    "Usage:",
+    "/resume <session-id|thread-name> [prompt]",
+    "/resume --last [prompt]",
+    "/resume --last --all [prompt]",
   ].join("\n");
 }
 

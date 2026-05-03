@@ -65,7 +65,7 @@ export function startCodexRun(config: AppConfig, prompt: string, workspace: stri
       }
 
       const output = existsSync(outputPath) ? readFileSync(outputPath, "utf8").trim() : "";
-      const fallbackSessionId = sessionId ?? discoveredSessionId ?? findLatestCodexSessionId(startedAt, workspace);
+      const fallbackSessionId = sessionId ?? discoveredSessionId ?? findLatestCodexSessionId({ startedAt, workspace });
       rmSync(tempDir, { recursive: true, force: true });
 
       if (code === 0) {
@@ -161,7 +161,7 @@ function extractSessionId(value: unknown, inSessionContext: boolean): string | u
   return undefined;
 }
 
-function findLatestCodexSessionId(startedAt: number, workspace: string): string | undefined {
+export function findLatestCodexSessionId(options: { startedAt?: number; workspace?: string; all?: boolean }): string | undefined {
   const root = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions");
   if (!existsSync(root)) {
     return undefined;
@@ -169,12 +169,12 @@ function findLatestCodexSessionId(startedAt: number, workspace: string): string 
 
   const candidates = listJsonlFiles(root)
     .map((path) => ({ path, mtimeMs: statSync(path).mtimeMs }))
-    .filter((item) => item.mtimeMs >= startedAt - 5000)
+    .filter((item) => options.startedAt == null || item.mtimeMs >= options.startedAt - 5000)
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
   for (const candidate of candidates) {
     const meta = readSessionMeta(candidate.path);
-    if (meta?.id && (!meta.cwd || meta.cwd === workspace)) {
+    if (meta?.id && (options.all || !options.workspace || !meta.cwd || meta.cwd === options.workspace)) {
       return meta.id;
     }
   }

@@ -48,6 +48,8 @@ Logs are written to `logs/launchd.out.log` and `logs/launchd.err.log`.
 - `/help` shows usage.
 - `/status` shows the current topic mapping and busy state.
 - `/session` shows the Codex session id for this topic.
+- `/resume <session-id|thread-name> [prompt]` binds this topic to an existing Codex session. If a prompt is supplied, it is sent immediately.
+- `/resume --last [prompt]` binds this topic to the latest Codex session in the current workspace. Add `--all` to ignore workspace filtering.
 - `/cwd [path]` shows or switches this topic's Codex workspace. Switching workspace starts the next message in a fresh Codex session because existing Codex sessions cannot be safely moved to another cwd.
 - `/new [prompt]` starts a fresh Codex session in this topic. If a prompt is supplied, it is sent immediately.
 - `/reset` forgets this topic's Codex session but keeps the topic workspace; the next normal message creates a new session.
