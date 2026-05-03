@@ -16,11 +16,18 @@ export interface CodexResult {
   sessionId?: string;
   output: string;
   stderr: string;
+  generatedImages: GeneratedImage[];
 }
 
 export interface CodexRunOptions {
   onStreamText?: (text: string) => void;
   onStreamEvent?: (text: string) => void;
+}
+
+export interface GeneratedImage {
+  path: string;
+  revisedPrompt?: string;
+  callId?: string;
 }
 
 export interface CodexSessionSummary {
@@ -55,6 +62,7 @@ export function startCodexRun(
   let stdoutBuffer = "";
   let stderr = "";
   let discoveredSessionId: string | undefined;
+  const generatedImages = new Map<string, GeneratedImage>();
 
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk: string) => {
@@ -62,7 +70,11 @@ export function startCodexRun(
     const lines = stdoutBuffer.split(/\r?\n/);
     stdoutBuffer = lines.pop() ?? "";
     for (const line of lines) {
-      discoveredSessionId = handleJsonEventLine(line, options) ?? discoveredSessionId;
+      const parsed = handleJsonEventLine(line, options);
+      discoveredSessionId = parsed.sessionId ?? discoveredSessionId;
+      for (const image of parsed.generatedImages) {
+        generatedImages.set(image.path, image);
+      }
     }
   });
 
@@ -76,9 +88,12 @@ export function startCodexRun(
   const promise = new Promise<CodexResult>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => {
-      const trailingId = handleJsonEventLine(stdoutBuffer, options);
-      if (trailingId) {
-        discoveredSessionId = trailingId;
+      const trailing = handleJsonEventLine(stdoutBuffer, options);
+      if (trailing.sessionId) {
+        discoveredSessionId = trailing.sessionId;
+      }
+      for (const image of trailing.generatedImages) {
+        generatedImages.set(image.path, image);
       }
 
       const output = existsSync(outputPath) ? readFileSync(outputPath, "utf8").trim() : "";
@@ -86,7 +101,7 @@ export function startCodexRun(
       rmSync(tempDir, { recursive: true, force: true });
 
       if (code === 0) {
-        resolve({ sessionId: fallbackSessionId, output, stderr: stderr.trim() });
+        resolve({ sessionId: fallbackSessionId, output, stderr: stderr.trim(), generatedImages: [...generatedImages.values()] });
         return;
       }
 
@@ -130,10 +145,13 @@ function terminateChild(child: ChildProcessWithoutNullStreams): void {
   }, 5000).unref();
 }
 
-function handleJsonEventLine(line: string, options: CodexRunOptions): string | undefined {
+function handleJsonEventLine(
+  line: string,
+  options: CodexRunOptions,
+): { sessionId?: string; generatedImages: GeneratedImage[] } {
   const trimmed = line.trim();
   if (!trimmed) {
-    return undefined;
+    return { generatedImages: [] };
   }
   try {
     const event = JSON.parse(trimmed) as unknown;
@@ -145,10 +163,53 @@ function handleJsonEventLine(line: string, options: CodexRunOptions): string | u
     if (streamText) {
       options.onStreamText?.(streamText);
     }
-    return extractSessionId(event, false);
+    return {
+      sessionId: extractSessionId(event, false),
+      generatedImages: extractGeneratedImages(event),
+    };
   } catch {
-    return undefined;
+    return { generatedImages: [] };
   }
+}
+
+function extractGeneratedImages(value: unknown): GeneratedImage[] {
+  if (value == null || typeof value !== "object") {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap(extractGeneratedImages);
+  }
+
+  const record = value as Record<string, unknown>;
+  const payload = record.payload && typeof record.payload === "object" ? (record.payload as Record<string, unknown>) : undefined;
+  const candidates = [record, payload].filter((item): item is Record<string, unknown> => Boolean(item));
+  const images: GeneratedImage[] = [];
+
+  for (const candidate of candidates) {
+    const type = typeof candidate.type === "string" ? candidate.type : "";
+    const savedPath = typeof candidate.saved_path === "string" ? candidate.saved_path : undefined;
+    if ((type === "image_generation_end" || type === "image_generation_call") && savedPath) {
+      images.push({
+        path: savedPath,
+        revisedPrompt: typeof candidate.revised_prompt === "string" ? candidate.revised_prompt : undefined,
+        callId: typeof candidate.call_id === "string" ? candidate.call_id : typeof candidate.id === "string" ? candidate.id : undefined,
+      });
+    }
+  }
+
+  for (const nested of Object.values(record)) {
+    images.push(...extractGeneratedImages(nested));
+  }
+  return dedupeGeneratedImages(images);
+}
+
+function dedupeGeneratedImages(images: GeneratedImage[]): GeneratedImage[] {
+  const deduped = new Map<string, GeneratedImage>();
+  for (const image of images) {
+    deduped.set(image.path, image);
+  }
+  return [...deduped.values()];
 }
 
 function extractStreamText(value: unknown): string | undefined {

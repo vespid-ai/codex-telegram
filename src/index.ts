@@ -1,4 +1,4 @@
-import { Bot, type Context } from "grammy";
+import { Bot, InputFile, type Context } from "grammy";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -10,6 +10,7 @@ import {
   resolveCodexSessionRef,
   startCodexRun,
   type CodexRun,
+  type GeneratedImage,
   type CodexSessionSummary,
 } from "./codex.js";
 import { StateStore, topicKey, type TopicSession } from "./state.js";
@@ -287,9 +288,12 @@ async function runPrompt(ctx: Context, prompt: string, forceFresh: boolean): Pro
       }
     }
 
-    const finalText = result.output || result.stderr || "Codex completed without a final message.";
     await streamPreview.finish("Codex finished. Final result below.");
-    await replyLong(ctx, finalText, "Codex result");
+    const sentImages = await replyGeneratedImages(ctx, result.generatedImages);
+    const finalText = result.output || result.stderr || (sentImages > 0 ? "" : "Codex completed without a final message.");
+    if (finalText) {
+      await replyLong(ctx, finalText, "Codex result");
+    }
   } catch (error) {
     await streamPreview.finish("Codex stopped. Error below.");
     await replyLong(ctx, formatError(error), "Codex error");
@@ -399,6 +403,28 @@ async function replyInTopic(ctx: Context, text: string) {
       return undefined;
     }
   }
+}
+
+async function replyGeneratedImages(ctx: Context, images: GeneratedImage[]): Promise<number> {
+  const threadId = ctx.message?.message_thread_id;
+  let sent = 0;
+
+  for (const image of images) {
+    if (!existsSync(image.path)) {
+      await replyInTopic(ctx, `Generated image file is missing:\n${image.path}`);
+      continue;
+    }
+
+    try {
+      await ctx.replyWithPhoto(new InputFile(image.path), threadId ? { message_thread_id: threadId } : undefined);
+      sent += 1;
+    } catch (error) {
+      console.error("failed to send generated image", error);
+      await replyInTopic(ctx, `Generated image saved locally, but Telegram upload failed:\n${image.path}`);
+    }
+  }
+
+  return sent;
 }
 
 function createTelegramStreamPreview(ctx: Context): {
